@@ -10,6 +10,10 @@ outputs/
 .vscode/
 data/*
 *.npy
+model/
+wandb/
+.netrc
+checkpoint.pt
 !DB_Utility.txt
 !contextIGB.txt
 !contextPasquier99.txt

@@ -6,7 +6,6 @@ import numpy as np
 
 
 LIMIT = 100000
-Rule = namedtuple("Rule", ("itemsets", "utility"))
 
 
 def convert_list_str2float32(str_list):
@@ -61,13 +60,28 @@ class HighUtilityItemsetsMining:
     def _create_random_pbv(self):
         return np.random.binomial(1, 0.5, len(self.items))
 
-    def _convert_bv2tuple_x(self, bv):
-        return tuple(sorted([self.b2i_dict[i] for i, v in enumerate(bv) if v == 1]))
+    def calc_utility_bv(self, bv):
+        itemsets = self.convert_bv2tuple_x(bv)
+        print("this bit-vector represented itemsets is ")
+        print(itemsets)
+        return self._calc_utility(tuple(bv))
+
+    def calc_utility_x(self, x):
+        bv = convert_tuple_x2bv(x)
+        return self._calc_utility(tuple(bv))
+
+    def convert_bv2tuple_x(self, bv):
+        return tuple(sorted([int(self.b2i_dict[i]) for i, v in enumerate(bv) if v == 1]))
+
+    def convert_tuple_x2bv(self, x):
+        bv = np.array([0 for _ in range(len(self.items))], dtype=np.int8)
+        for item in x:
+            bv[self.i2b_dict[item]] = 1
+        return bv
 
     @lru_cache(maxsize=LIMIT)
     def _calc_utility(self, bv):
         bv = np.array(bv, dtype=np.int8)
-        itemsets = self._convert_bv2tuple_x(bv)
 
         bv_mask = bv > 0
         # After masking the bit-vector, check if all the elements of the itemset are present.
@@ -79,7 +93,21 @@ class HighUtilityItemsetsMining:
         utility = np.sum(filtered[np.all(filtered, axis=1)])
         return utility
     
+    # create Random Itemset and Reward(this itemset)
     def sample(self):
-        bv = self._create_random_pbv().astype(np.int8)
+        bv = self._create_random_pbv()
         utility = self._calc_utility(tuple(bv))
+        # bv = bv.astype(np.float32)
+        return bv, utility
+
+    # create Random and valid Itemset and Reward(this itemset)
+    def valid_sample(self):
+        # sampleing transaction
+        random_t = np.random.randint(self.bit_map.shape[0])
+        sample_transaction = self.bit_map[random_t]
+        # Randomly create an itemset from only the items that appear in the transaction.
+        prob_bv = [0.5 if i > 0 else 0 for i in sample_transaction]
+        bv = np.random.binomial(1, prob_bv)
+        utility = self._calc_utility(tuple(bv))
+        # bv = bv.astype(np.float32)
         return bv, utility
