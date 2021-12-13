@@ -13,6 +13,7 @@ data/*
 model/
 wandb/
 .netrc
+!.gitkeep
 checkpoint.pt
 !DB_Utility.txt
 !contextIGB.txt
