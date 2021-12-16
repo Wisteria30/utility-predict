@@ -3,6 +3,7 @@
 from collections import namedtuple
 from functools import lru_cache
 import numpy as np
+import random
 
 
 LIMIT = 100000
@@ -62,9 +63,7 @@ class HighUtilityItemsetsMining:
 
     def calc_utility_bv(self, bv):
         itemsets = self.convert_bv2tuple_x(bv)
-        print("this bit-vector represented itemsets is ")
-        print(itemsets)
-        return self._calc_utility(tuple(bv))
+        return itemsets, self._calc_utility(tuple(bv))
 
     def calc_utility_x(self, x):
         bv = convert_tuple_x2bv(x)
@@ -110,4 +109,19 @@ class HighUtilityItemsetsMining:
         bv = np.random.binomial(1, prob_bv)
         utility = self._calc_utility(tuple(bv))
         # bv = bv.astype(np.float32)
+        return bv, utility
+
+
+    def uniform_valid_sample(self, n_count):
+        # sampleing transaction
+        random_t = np.random.randint(self.bit_map.shape[0])
+        # get item index
+        sample_transaction = np.where(self.bit_map[random_t] > 0)[0]
+        # データセット数に対して、アイテムセットの長さを均等にデータを作成
+        itemset_length = n_count % len(sample_transaction) + 1
+        sample_itemset = random.sample(set(sample_transaction), itemset_length)
+        bv = np.zeros(len(self.items))
+        for i in sample_itemset:
+            bv[i] += 1
+        utility = self._calc_utility(tuple(bv))
         return bv, utility
