@@ -9,16 +9,17 @@ import wandb
 
 from config import set_seed, DATASET_NUM, DATA
 from hui_env import HighUtilityItemsetsMining
-from model import MLP
+from model import LengthBasedMLP
 from pytorchtools import EarlyStopping
 # Predict Utility
 
 fold = 5
 learning_rate = 1e-3
-epochs = 100
+epochs = 500
 batch_size = 1024
 # early stopping patience; how long to wait after last time validation loss improved.
 patience = 10
+divisions = 3
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 wandb.init(project="util-pred", entity="wis30")
@@ -29,27 +30,6 @@ wandb.config = {
     "K-fold": fold,
     "Early stopping patience": patience
 }
-
-
-def calc_sample_x(transaction, env):
-    transaction = np.array(list(map(int, transaction.split(" "))))
-    return env.calc_utility_x(transaction)
-
-
-def build_model(input_dim):
-    model = nn.Sequential(
-        nn.Linear(input_dim, 512),
-        nn.BatchNorm1d(512),
-        nn.LeakyReLU(),
-        nn.Linear(512, 256),
-        nn.BatchNorm1d(256),
-        nn.LeakyReLU(),
-        nn.Linear(256, 128),
-        nn.BatchNorm1d(128),
-        nn.LeakyReLU(),
-        nn.Linear(128, 1)
-    )
-    return model
 
 
 def setup_dataset(X, y, data_split=True):
@@ -65,7 +45,8 @@ def setup_dataset(X, y, data_split=True):
         return train_data, test_data
     return dataset
 
-def train_loop(dataloader, model, loss_fn, optimizer):
+
+def train_loop(dataloader, model, loss_fn, optimizers):
     model.train()
     size = len(dataloader.dataset)
     train_loss = None
@@ -75,9 +56,11 @@ def train_loop(dataloader, model, loss_fn, optimizer):
         loss = loss_fn(pred, y)
 
         # Backpropagation
-        optimizer.zero_grad()
+        for optimizer in optimizers:
+            optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        for optimizer in optimizers:
+            optimizer.step()
 
         if batch % 100 == 0:
             loss, current = loss.item(), batch * len(X)
@@ -106,7 +89,7 @@ def test_loop(dataloader, model, loss_fn):
     return test_loss
 
 
-def train(dataset):
+def train(dataset, env):
     models = []
 
     kfold = KFold(n_splits=fold, shuffle=True)
@@ -116,16 +99,16 @@ def train(dataset):
         valid_data = Subset(dataset, valid_idx)
         valid_dataloader = DataLoader(valid_data, batch_size)
 
-        input_dim = len(dataset[0][0])
-        model = build_model(input_dim).to(device)
+        input_dim = len(env.items)
+        model = LengthBasedMLP(input_dim, divisions, env.tran_length, device)
         loss_fn = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        optimizers = [optim.Adam(model.models[i].parameters(), lr=learning_rate) for i in range(divisions)]
         early_stopping = EarlyStopping(patience=patience, verbose=True)
-        wandb.watch(model, criterion=loss_fn, idx=i)
+        # wandb.watch(model, criterion=loss_fn, idx=i)
 
         for t in range(epochs):
             print(f"Epoch {t+1}\n-------------------------------")
-            train_loss = train_loop(train_dataloader, model, loss_fn, optimizer)
+            train_loss = train_loop(train_dataloader, model, loss_fn, optimizers)
             val_loss = test_loop(valid_dataloader, model, loss_fn)
             wandb.log({f"{i}-Fold RMSE train loss": train_loss})
             wandb.log({f"{i}-Fold RMSE val loss": val_loss})
@@ -210,62 +193,15 @@ def main():
     X = np.load(feature_npy, allow_pickle=True)
     y = np.load(label_npy, allow_pickle=True)
     train_data, test_data = setup_dataset(X, y)
-    models = train(train_data)
+    env = HighUtilityItemsetsMining()
+    models = train(train_data, env)
     test(test_data, models)
     test_sample(test_data, models, 10)
+    test_each_length(test_data, models)
 
     for i, model in enumerate(models):
-        model_path = f"model/{DATA}_{DATASET_NUM}_{i}.pth"
+        model_path = f"model/length/{DATA}_{DATASET_NUM}_{i}.pth"
         torch.save(model.to("cpu").state_dict(), model_path)
-
-
-def distribution():
-    set_seed()
-    feature_npy = f"dataset/{DATA}_feature_{DATASET_NUM}.npy"
-    label_npy = f"dataset/{DATA}_label_{DATASET_NUM}.npy"
-    # load
-    X = np.load(feature_npy, allow_pickle=True)
-    y = np.load(label_npy, allow_pickle=True)
-    train_data, test_data = setup_dataset(X, y)
-    counter = dict()
-    for data, _ in test_data:
-        data = data.to("cpu").detach().numpy().copy()
-        cnt = np.sum(data).astype(int)
-
-        if cnt in counter:
-            counter[cnt] += 1
-        else:
-            counter[cnt] = 1
-
-    for cnt, value in sorted(counter.items(), key=lambda x: x[0]):
-        print(cnt, value)
-
-
-def test_1_itemsets():
-    set_seed()
-    feature_npy = f"dataset/{DATA}_feature_{DATASET_NUM}.npy"
-    label_npy = f"dataset/{DATA}_label_{DATASET_NUM}.npy"
-    # load
-    X = np.load(feature_npy, allow_pickle=True)
-    y = np.load(label_npy, allow_pickle=True)
-    train_data, test_data = setup_dataset(X, y)
-    items_length = len(test_data[0][0])
-    
-    env = HighUtilityItemsetsMining()
-    # 長さ1のやつでテスト
-    ones = np.array([1] * items_length, dtype=np.float32)
-    X = np.diag(ones)
-    y = np.array([env.calc_utility_bv(bv)[1] for bv in X])
-
-    dataset = setup_dataset(X, y, data_split=False)
-    models = []
-    for i in range(5):
-        path = f"model/{DATA}_{DATASET_NUM}_{i}.pth"
-        model = build_model(items_length).to(device)
-        model.load_state_dict(torch.load(path))
-        model.eval()
-        models.append(model)
-    test_sample(dataset, models, -1)
 
 
 def predict():
@@ -276,12 +212,13 @@ def predict():
     X = np.load(feature_npy, allow_pickle=True)
     y = np.load(label_npy, allow_pickle=True)
     _, test_data = setup_dataset(X, y)
-    items_length = len(test_data[0][0])
+    env = HighUtilityItemsetsMining()
+    input_dim = len(env.items)
 
     models = []
     for i in range(5):
-        path = f"model/{DATA}_{DATASET_NUM}_{i}.pth"
-        model = build_model(items_length).to(device)
+        path = f"model/length/{DATA}_{DATASET_NUM}_{i}.pth"
+        model = LengthBasedMLP(input_dim, divisions, env.tran_length, device)
         model.load_state_dict(torch.load(path))
         model.eval()
         models.append(model)

@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from torch.multiprocessing import Pool, set_start_method
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -7,55 +8,40 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 from sklearn.model_selection import KFold, train_test_split
 import wandb
 
+# KDE
+from scipy.stats import gaussian_kde
+import matplotlib
+import matplotlib as mpl
+mpl.use('Agg')
+import matplotlib.pyplot as plt
+
 from config import set_seed, DATASET_NUM, DATA
 from hui_env import HighUtilityItemsetsMining
+from loss import L1RelativeLoss
+from model import EmbeddingModel
 from pytorchtools import EarlyStopping
 # Predict Utility
 
 fold = 5
-learning_rate = 0.01
-epochs = 500
-batch_size = 128
+learning_rate = 0.05
+# learning_rate = 1e4
+epochs = 1000
+# batch_size = 1024
+batch_size = 64
 embedding_dim = 128
 # early stopping patience; how long to wait after last time validation loss improved.
 patience = 10
+weight = 1e4
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-wandb.init(project="util-pred", entity="wis30")
-wandb.config = {
-    "learning_rate": learning_rate,
-    "epochs": epochs,
-    "batch_size": batch_size,
-    "K-fold": fold,
-    "Early stopping patience": patience
-}
-
-
-class Model(nn.Module):
-    def __init__(self, vocab_size, embedding_dim):
-        super().__init__()
-        hidden_1 = 512
-        hidden_2 = 256
-        hidden_3 = 128
-        output = 1
-
-        self.embeddings = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
-        self.fc1 = nn.Linear(embedding_dim, hidden_1)
-        self.bn1 = nn.BatchNorm1d(hidden_1)
-        self.fc2 = nn.Linear(hidden_1, hidden_2)
-        self.bn2 = nn.BatchNorm1d(hidden_2)
-        self.fc3 = nn.Linear(hidden_2, hidden_3)
-        self.bn3 = nn.BatchNorm1d(hidden_3)
-        self.fc4 = nn.Linear(hidden_3, output)
-
-    def forward(self, x):
-        x = self.embeddings(x)
-        x = torch.mean(x, 1)
-        x = F.leaky_relu(self.bn1(self.fc1(x)))
-        x = F.leaky_relu(self.bn2(self.fc2(x)))
-        x = F.leaky_relu(self.bn3(self.fc3(x)))
-        return self.fc4(x)
-
+# wandb.init(project="util-pred", entity="wis30")
+# wandb.config = {
+#     "learning_rate": learning_rate,
+#     "epochs": epochs,
+#     "batch_size": batch_size,
+#     "K-fold": fold,
+#     "Early stopping patience": patience
+# }
 
 class Normalization:
     def __init__(self):
@@ -72,6 +58,10 @@ class Normalization:
         x = (z * self.std) + self.mean
         return x
 
+    def transform_loss(self, loss):
+        return loss * self.std
+
+
 
 def convert_embedding2bv(x):
     # 修正後注意
@@ -85,6 +75,7 @@ def convert_embedding2bv(x):
 
 
 def setup_dataset(X, y, data_split=True):
+    print("setup dataset")
     # Embedding Layerに突っ込むので、one-hotではなくindexのリストをintで突っ込む
     vocab_data = [[] for _ in range(len(X))]
     for i, j in zip(*np.where(X > 0)):
@@ -105,10 +96,11 @@ def setup_dataset(X, y, data_split=True):
     # setup
     dataset = TensorDataset(X, y)
     if data_split:
-        train_idx, test_idx = train_test_split(list(range(len(dataset))), test_size=0.2)
+        train_idx, test_idx = train_test_split(list(range(len(dataset))), test_size=0.2, shuffle=False)
         train_data = Subset(dataset, train_idx)
         test_data = Subset(dataset, test_idx)
         return train_data, test_data, normalization
+    print("Done")
     return dataset, normalization
 
 
@@ -120,7 +112,6 @@ def train_loop(dataloader, model, loss_fn, optimizer):
         # Compute prediction and loss
         pred = model(X)
         loss = loss_fn(pred, y)
-
         # Backpropagation
         optimizer.zero_grad()
         loss.backward()
@@ -128,7 +119,7 @@ def train_loop(dataloader, model, loss_fn, optimizer):
 
         if batch % 100 == 0:
             loss, current = loss.item(), batch * len(X)
-            loss = np.sqrt(loss)
+            # loss = np.sqrt(loss)
             train_loss = loss
             print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
@@ -152,7 +143,7 @@ def test_loop(dataloader, model, loss_fn):
     return test_loss
 
 
-def train(dataset, env):
+def train(dataset, env, normalization):
     models = []
 
     kfold = KFold(n_splits=fold, shuffle=True)
@@ -163,19 +154,20 @@ def train(dataset, env):
         valid_dataloader = DataLoader(valid_data, batch_size)
 
         vocab_size = len(env.items) + 1
-        model = Model(vocab_size, embedding_dim).to(device)
-        loss_fn = nn.MSELoss()
+        model = EmbeddingModel(vocab_size, embedding_dim).to(device)
+        loss_fn = L1RelativeLoss(normalization.mean, weight)
         optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+        # optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         early_stopping = EarlyStopping(patience=patience, verbose=True)
-        wandb.watch(model, criterion=loss_fn, idx=i)
+        # wandb.watch(model, criterion=loss_fn, idx=i)
 
         for t in range(epochs):
             print(f"Epoch {t+1}\n-------------------------------")
             train_loss = train_loop(train_dataloader, model, loss_fn, optimizer)
             val_loss = test_loop(valid_dataloader, model, loss_fn)
-            print(f"Validation Error: \n Avg RMSE loss: {val_loss:>8f} \n")
-            wandb.log({f"{i}-Fold RMSE train loss": train_loss})
-            wandb.log({f"{i}-Fold RMSE val loss": val_loss})
+            print(f"Validation Error: \n Avg loss: {val_loss:>8f} \n")
+            # wandb.log({f"{i}-Fold RMSE train loss": train_loss})
+            # wandb.log({f"{i}-Fold RMSE val loss": val_loss})
             early_stopping(val_loss, model)
             if early_stopping.early_stop:
                 print("Early stopping")
@@ -190,7 +182,48 @@ def train(dataset, env):
     return models
 
 
-def test(test_data, models):
+def model_parallel(inputs):
+    n, train_dataloader, valid_dataloader, env, normalization = inputs
+    vocab_size = len(env.items) + 1
+    model = EmbeddingModel(vocab_size, embedding_dim).to(device)
+    loss_fn = L1RelativeLoss(normalization.mean, weight)
+    optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+    # optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    early_stopping = EarlyStopping(patience=patience, verbose=True)
+
+    for t in range(epochs):
+        print(f"Epoch {t+1}\n-------------------------------")
+        train_loss = train_loop(train_dataloader, model, loss_fn, optimizer)
+        val_loss = test_loop(valid_dataloader, model, loss_fn)
+        print(f"{n}-Fold Validation Error: \n Avg loss: {val_loss:>8f} \n")
+        early_stopping(val_loss, model)
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
+
+    model.load_state_dict(torch.load('checkpoint.pt'))
+    model.eval()
+    print("Fold Done!")
+    return model
+
+
+def train_parallel(dataset, env, normalization):
+    kfold = KFold(n_splits=fold, shuffle=True)
+    values = []
+    for i, (train_idx, valid_idx) in enumerate(kfold.split(dataset)):
+        train_data = Subset(dataset, train_idx)
+        train_dataloader = DataLoader(train_data, batch_size)
+        valid_data = Subset(dataset, valid_idx)
+        valid_dataloader = DataLoader(valid_data, batch_size)
+
+        values.append((i, train_dataloader, valid_dataloader, env, normalization))
+
+    p = Pool(fold)
+    models = p.map(model_parallel, values)
+    print("Train Done!")
+    return models
+
+def test(test_data, models, normalization):
     test_dataloader = DataLoader(test_data, batch_size)
     losses = []
     loss_fn = nn.MSELoss()
@@ -200,8 +233,9 @@ def test(test_data, models):
         losses.append(test_loss)
 
     loss = np.average(losses)
-    print("Test Loss: ", loss)
-    wandb.log({"Test Loss": loss})
+    loss_utility = normalization.transform_loss(loss)
+    print(f"Test RMSE Loss: {loss:>8f}({loss_utility:>8f})")
+    # wandb.log({"Test Loss": loss})
 
 
 def test_each_length(test_data, models, normalization):
@@ -223,8 +257,8 @@ def test_each_length(test_data, models, normalization):
         for model in models:
             loss += test_loop(dataloader, model, loss_fn)
         loss /= len(models)
-        loss_x = normalization.get_x(loss)
-        print(f"{i + 1}-Itemset RMSE Loss: {loss:>8f}({loss_x})")
+        loss_utility = normalization.transform_loss(loss)
+        print(f"{i + 1}-Itemset RMSE Loss: {loss:>8f}({loss_utility:>8f})")
 
 
 def test_sample(test_data, models, normalization, sample_n):
@@ -260,8 +294,9 @@ def main():
     y = np.load(label_npy, allow_pickle=True)
     env = HighUtilityItemsetsMining()
     train_data, test_data, normalization = setup_dataset(X, y)
-    models = train(train_data, env)
-    test(test_data, models)
+    models = train_parallel(train_data, env, normalization)
+    # models = train(train_data, env, normalization)
+    test(test_data, models, normalization)
     test_sample(test_data, models, normalization, 10)
     test_each_length(test_data, models, normalization)
 
@@ -278,18 +313,78 @@ def predict():
     X = np.load(feature_npy, allow_pickle=True)
     y = np.load(label_npy, allow_pickle=True)
     _, test_data, normalization = setup_dataset(X, y)
-    items_length = len(test_data[0][0])
+
+    env = HighUtilityItemsetsMining()
+    vocab_size = len(env.items) + 1
 
     models = []
     for i in range(5):
         path = f"model/embedding/{DATA}_{DATASET_NUM}_{i}.pth"
-        model = build_model(items_length).to(device)
+        model = EmbeddingModel(vocab_size, embedding_dim).to(device)
         model.load_state_dict(torch.load(path))
         model.eval()
         models.append(model)
 
-    test_each_length(test_data, models)
+    test(test_data, models, normalization)
+    test_each_length(test_data, models, normalization)
+
+
+def get_error(dataloader, model):
+    errors = np.array([])
+    model.eval()
+    size = len(dataloader.dataset)
+    print("create Error")
+    for batch, (X, y) in enumerate(dataloader):
+        # Compute prediction and loss
+        pred = model(X)
+        error = y - pred
+        error = error.squeeze().to("cpu").detach().numpy().copy()
+        errors = np.concatenate([errors, error])
+
+    return errors
+
+
+def kde(dataset, env):
+    plt.style.use('ggplot')
+
+    dataloader = DataLoader(dataset, 1024)
+    vocab_size = len(env.items) + 1
+    model = EmbeddingModel(vocab_size, embedding_dim).to(device)
+
+    errors = get_error(dataloader, model)
+
+    # x軸をGridするためのデータも生成
+    x_grid = np.linspace(min(errors), max(errors), num=100)
+    # データを正規化したヒストグラムを表示する用
+    weights = np.ones_like(errors)/float(len(errors))
+
+    kde_model = gaussian_kde(errors)
+    y = kde_model(x_grid)
+
+    fig = plt.figure(figsize=(14,7))
+    plt.plot(x_grid, y)
+    plt.hist(errors, alpha=0.3, bins=20, weights=weights)
+
+    fig.savefig("errors.png")
+    print("graph save!")
+
+
+def error_kde():
+    set_seed()
+    feature_npy = f"dataset/{DATA}_feature_{DATASET_NUM}.npy"
+    label_npy = f"dataset/{DATA}_label_{DATASET_NUM}.npy"
+    # load
+    X = np.load(feature_npy, allow_pickle=True)
+    y = np.load(label_npy, allow_pickle=True)
+    env = HighUtilityItemsetsMining()
+    train_data, test_data, normalization = setup_dataset(X, y)
+    kde(test_data, env)
 
 
 if __name__ == "__main__":
+    try:
+        set_start_method('spawn', force=True)
+    except RuntimeError:
+        print("RuntimeError")
+        pass
     main()

@@ -42,6 +42,7 @@ class HighUtilityItemsetsMining:
         cache_limit=100000,
     ):
         self.database, self.items, self.utils = load_hui_db(data_path)
+        self.tran_length = len(self.database[0])
         # Specify the maximum LRU cache as a global variable
         global LIMIT
         LIMIT = cache_limit
@@ -69,6 +70,10 @@ class HighUtilityItemsetsMining:
         bv = convert_tuple_x2bv(x)
         return self._calc_utility(tuple(bv))
 
+    def calc_frequent_bv(self, bv):
+        itemsets = self.convert_bv2tuple_x(bv)
+        return itemsets, self._calc_frequent(tuple(bv))
+
     def convert_bv2tuple_x(self, bv):
         return tuple(sorted([int(self.b2i_dict[i]) for i, v in enumerate(bv) if v == 1]))
 
@@ -91,7 +96,21 @@ class HighUtilityItemsetsMining:
         # Extract columns where all elements of the itemset are zero or greater and calculate the sum.
         utility = np.sum(filtered[np.all(filtered, axis=1)])
         return utility
-    
+
+    @lru_cache(maxsize=LIMIT)
+    def _calc_frequent(self, bv):
+        bv = np.array(bv, dtype=np.int8)
+
+        bv_mask = bv > 0
+        # After masking the bit-vector, check if all the elements of the itemset are present.
+        # masking the bit-vector
+        filtered = self.bit_map[:, bv_mask]
+        if filtered.size == 0:
+            return 0
+        # Extract columns where all elements of the itemset are zero or greater and calculate the sum.
+        frequent = np.sum(np.all(filtered, axis=1))
+        return frequent
+
     # create Random Itemset and Reward(this itemset)
     def sample(self):
         bv = self._create_random_pbv()
@@ -110,7 +129,6 @@ class HighUtilityItemsetsMining:
         utility = self._calc_utility(tuple(bv))
         # bv = bv.astype(np.float32)
         return bv, utility
-
 
     def uniform_valid_sample(self, n_count):
         # sampleing transaction
